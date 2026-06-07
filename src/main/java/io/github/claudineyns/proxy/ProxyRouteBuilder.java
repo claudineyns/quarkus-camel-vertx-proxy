@@ -179,7 +179,7 @@ public class ProxyRouteBuilder extends RouteBuilder {
             + (ex != null ? " — " + rootCause(ex) : "");
 
         if (ex != null) {
-            log.warn("[{}] {} — {}: {}", hostPort, detail, ex.getClass().getName(), ex.getMessage());
+            log.warnf("[%s] %s — %s: %s", hostPort, detail, ex.getClass().getName(), ex.getMessage());
         }
 
         buildProblem(exchange.getMessage(), 502, "/problems/bad-gateway", "Bad Gateway", detail,
