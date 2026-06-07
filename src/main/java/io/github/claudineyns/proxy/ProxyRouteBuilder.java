@@ -24,10 +24,11 @@ public class ProxyRouteBuilder extends RouteBuilder {
     static final String PROP_CB_START_NS  = "proxyCbStartNs";
     static final String LOG_NAME          = "proxy.route";
 
-    // RFC 7230 §6.1 hop-by-hop headers (lowercase for case-insensitive matching)
+    // RFC 7230 §6.1 hop-by-hop headers + legacy proxy headers (lowercase for case-insensitive matching)
     static final Set<String> HOP_BY_HOP = Set.of(
         "connection", "keep-alive", "transfer-encoding", "te",
-        "trailers", "upgrade", "proxy-authorization", "proxy-authenticate"
+        "trailers", "upgrade", "proxy-authorization", "proxy-authenticate",
+        "proxy-connection"  // non-standard legacy header; must not be forwarded to the backend
     );
 
     @Inject
