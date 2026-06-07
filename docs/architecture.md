@@ -612,6 +612,18 @@ Para inspecionar headers em cada fase, iniciar o container com `QUARKUS_LOG_CATE
 
 ---
 
+## Convenções de código
+
+| Convenção | Regra |
+|---|---|
+| `final` | Obrigatório em variáveis locais e parâmetros de método quando o valor não for reatribuído |
+| Logger | `org.jboss.logging.Logger` — logger padrão do Quarkus; nunca SLF4J direto (`LoggerFactory`) nem `java.util.logging` |
+| Declaração | `private static final org.jboss.logging.Logger log = org.jboss.logging.Logger.getLogger(Classe.class)` |
+| Formatação | `log.warnf(...)` / `log.debugf(...)` com `%s` (printf-style); nunca `{}` de SLF4J |
+| Comentários | Apenas quando o **porquê** é não-óbvio; sem javadoc de rotina, sem blocos multi-linha |
+
+---
+
 ## Fora do escopo
 
 - Suporte ao método `CONNECT` (tunneling TCP)
