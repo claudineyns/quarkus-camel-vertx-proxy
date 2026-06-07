@@ -1,0 +1,29 @@
+FROM eclipse-temurin:21-jre-alpine
+
+WORKDIR /deployments
+
+COPY target/quarkus-app/lib/           /deployments/lib/
+COPY target/quarkus-app/quarkus/       /deployments/quarkus/
+COPY target/quarkus-app/app/           /deployments/app/
+COPY target/quarkus-app/quarkus-run.jar /deployments/quarkus-run.jar
+
+EXPOSE 8080
+EXPOSE 8443
+EXPOSE 9000
+
+# -Xms128m                       : streaming sem body buffering — heap cresce gradualmente
+# -Xmx320m                       : cobre exchanges leves, estado CB por host, MeterRegistry
+# MaxMetaspaceSize=160m           : mais bytecode que bridge: Resilience4j, HTTP/2, mais Camel
+# ReservedCodeCacheSize=96m       : HTTP/2 encoder/decoder, CB por host, pipeline de headers
+# MaxDirectMemorySize=64m         : Vert.x/Netty direct buffers para HTTP/2 (HPACK, flow control)
+# UseG1GC + MaxGCPauseMillis=200  : GC orientado a pausas curtas para proxy
+# InitiatingHeapOccupancyPercent  : antecipa GC concurrent a 35% — múltiplos pools dinâmicos
+CMD ["java", \
+     "-Xms128m", "-Xmx320m", \
+     "-XX:MaxMetaspaceSize=160m", \
+     "-XX:ReservedCodeCacheSize=96m", \
+     "-XX:MaxDirectMemorySize=64m", \
+     "-XX:+UseG1GC", \
+     "-XX:MaxGCPauseMillis=200", \
+     "-XX:InitiatingHeapOccupancyPercent=35", \
+     "-jar", "quarkus-run.jar"]

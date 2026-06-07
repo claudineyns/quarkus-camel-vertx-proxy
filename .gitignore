@@ -1,0 +1,5 @@
+infra/certs/
+target/
+.vscode/
+.claude/
+temp/
