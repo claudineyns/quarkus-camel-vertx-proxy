@@ -25,7 +25,7 @@ public class ProxyTest {
         final String target  = path + (query != null ? "?" + query : "");
 
         // Absolute URI in request-line — forward-proxy mode (no x-proxy-backend-base-url header).
-        // The proxy extracts scheme + host from Exchange.HTTP_URL populated by the platform-http consumer.
+        // The proxy extracts scheme + host via RoutingContext.request().uri() (raw request-line URI).
         final String requestLine = "GET " + uri.getScheme() + "://" + host + target + " HTTP/1.1";
 
         System.out.println("[proxy-test] backend : " + backendUrl);
