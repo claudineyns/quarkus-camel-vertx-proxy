@@ -10,7 +10,6 @@ import org.apache.camel.LoggingLevel;
 import org.apache.camel.Message;
 import org.apache.camel.builder.RouteBuilder;
 import org.eclipse.microprofile.config.inject.ConfigProperty;
-
 import java.net.InetAddress;
 import java.net.URI;
 import java.util.Set;
@@ -18,6 +17,8 @@ import java.util.concurrent.TimeUnit;
 
 @ApplicationScoped
 public class ProxyRouteBuilder extends RouteBuilder {
+
+    private static final org.jboss.logging.Logger log = org.jboss.logging.Logger.getLogger(ProxyRouteBuilder.class);
 
     static final String PROP_TARGET_BASE  = "proxyTargetBase";
     static final String PROP_CB           = "proxyCb";
@@ -165,17 +166,21 @@ public class ProxyRouteBuilder extends RouteBuilder {
 
     private void handleConnectivityException(final Exchange exchange) {
         final CircuitBreaker cb = exchange.getProperty(PROP_CB, CircuitBreaker.class);
+        final Exception ex = exchange.getProperty(Exchange.EXCEPTION_CAUGHT, Exception.class);
+
         if (cb != null) {
-            final Exception ex = exchange.getProperty(Exchange.EXCEPTION_CAUGHT, Exception.class);
             cb.onError(elapsed(exchange), TimeUnit.NANOSECONDS,
                 ex != null ? ex : new RuntimeException("unknown connectivity failure"));
         }
 
         final String hostPort = exchange.getProperty(PROP_TARGET_BASE) != null
             ? extractHostPort(exchange.getProperty(PROP_TARGET_BASE, String.class)) : "unknown";
-        final Exception ex = exchange.getProperty(Exchange.EXCEPTION_CAUGHT, Exception.class);
         final String detail = "Connection failure: " + hostPort
             + (ex != null ? " — " + rootCause(ex) : "");
+
+        if (ex != null) {
+            log.warn("[{}] {} — {}: {}", hostPort, detail, ex.getClass().getName(), ex.getMessage());
+        }
 
         buildProblem(exchange.getMessage(), 502, "/problems/bad-gateway", "Bad Gateway", detail,
             exchange.getMessage().getHeader(Exchange.HTTP_PATH, "/", String.class));
