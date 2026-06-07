@@ -124,8 +124,9 @@ public class ProxyRouteBuilder extends RouteBuilder {
         msg.setHeader("Host",
             port > 0 ? backendUri.getHost() + ":" + port : backendUri.getHost());
 
-        // 8. Remove hop-by-hop headers + primary routing header
+        // 8. Remove hop-by-hop headers + primary routing header + query param headers
         removeHopByHopHeaders(msg);
+        removeQueryParamHeaders(msg);
         msg.removeHeader("x-proxy-backend-base-url");
 
         // Exchange.HTTP_PATH and Exchange.HTTP_RAW_QUERY carry path and query for the outbound request.
@@ -263,10 +264,12 @@ public class ProxyRouteBuilder extends RouteBuilder {
 
         if (rc instanceof RoutingContext routingContext) {
             final String clientIp = routingContext.request().remoteAddress().hostAddress();
-            final String existing = msg.getHeader("X-Forwarded-For", String.class);
-            msg.setHeader("X-Forwarded-For", existing != null ? existing + ", " + clientIp : clientIp);
+            if (clientIp != null) {
+                final String existing = msg.getHeader("X-Forwarded-For", String.class);
+                msg.setHeader("X-Forwarded-For", existing != null ? existing + ", " + clientIp : clientIp);
+            }
             msg.setHeader("X-Forwarded-Proto", routingContext.request().scheme());
-            msg.setHeader("X-Forwarded-Port", routingContext.request().localAddress().port());
+            msg.setHeader("X-Forwarded-Port", String.valueOf(routingContext.request().localAddress().port()));
         } else {
             msg.setHeader("X-Forwarded-Proto", incomingScheme(exchange));
         }
@@ -285,6 +288,20 @@ public class ProxyRouteBuilder extends RouteBuilder {
             }
         }
         msg.getHeaders().keySet().removeIf(k -> HOP_BY_HOP.contains(k.toLowerCase()));
+    }
+
+    // Camel's platform-http consumer promotes query params to message headers.
+    // Remove them so they don't leak to the backend as spurious HTTP headers.
+    private void removeQueryParamHeaders(final Message msg) {
+        final String rawQuery = msg.getHeader(Exchange.HTTP_RAW_QUERY, String.class);
+        if (rawQuery == null || rawQuery.isBlank()) return;
+        for (final String pair : rawQuery.split("&")) {
+            final int eq = pair.indexOf('=');
+            final String name = (eq >= 0 ? pair.substring(0, eq) : pair).strip();
+            if (!name.isEmpty()) {
+                msg.removeHeader(name);
+            }
+        }
     }
 
     // --- RFC 9457 problem response ---
