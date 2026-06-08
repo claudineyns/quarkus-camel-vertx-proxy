@@ -37,6 +37,7 @@ MSYS_NO_PATHCONV=1 podman run -d \
   -e QUARKUS_TLS_PROXY_TLS_KEY_STORE_PEM_0_CERT=/deployments/certs/server.crt \
   -e QUARKUS_TLS_PROXY_TLS_KEY_STORE_PEM_0_KEY=/deployments/certs/server.key \
   -e QUARKUS_LOG_CATEGORY__PROXY_ROUTE__LEVEL=DEBUG \
+  -e PROXY_ACTIVE_REQUESTS_LIMIT="${PROXY_ACTIVE_REQUESTS_LIMIT:--1}" \
   "$IMAGE_NAME"
 
 echo "[podman] [$CONTAINER_NAME] started"

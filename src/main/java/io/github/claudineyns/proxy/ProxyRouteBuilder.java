@@ -19,10 +19,11 @@ public class ProxyRouteBuilder extends RouteBuilder {
 
     private static final org.jboss.logging.Logger log = org.jboss.logging.Logger.getLogger(ProxyRouteBuilder.class);
 
-    static final String PROP_TARGET_BASE  = "proxyTargetBase";
-    static final String PROP_CB           = "proxyCb";
-    static final String PROP_CB_START_NS  = "proxyCbStartNs";
-    static final String LOG_NAME          = "proxy.route";
+    static final String PROP_TARGET_BASE    = "proxyTargetBase";
+    static final String PROP_CB             = "proxyCb";
+    static final String PROP_CB_START_NS    = "proxyCbStartNs";
+    static final String PROP_ACTIVE_ACQUIRED = "proxyActiveAcquired";
+    static final String LOG_NAME            = "proxy.route";
 
     // RFC 7230 §6.1 hop-by-hop headers + legacy proxy headers (lowercase for case-insensitive matching)
     static final Set<String> HOP_BY_HOP = Set.of(
@@ -96,17 +97,20 @@ public class ProxyRouteBuilder extends RouteBuilder {
             return;
         }
 
-        // 4. High-water-mark check
-        if (pressureMonitor.isUnderPressure()) {
+        // 4. High-water-mark: acquire in-flight slot atomically
+        if (!pressureMonitor.tryAcquire()) {
             buildProblem(msg, 503, "/problems/service-unavailable", "Service Unavailable",
                 "Connection queue threshold exceeded", path);
             return;
         }
+        exchange.setProperty(PROP_ACTIVE_ACQUIRED, Boolean.TRUE);
 
         // 5. Circuit breaker check
         final String hostPort = extractHostPort(backendBase);
         final CircuitBreaker cb = cbRegistry.circuitBreaker(hostPort);
         if (!cb.tryAcquirePermission()) {
+            pressureMonitor.release();
+            exchange.removeProperty(PROP_ACTIVE_ACQUIRED);
             buildProblem(msg, 502, "/problems/bad-gateway", "Bad Gateway",
                 "Circuit open: " + hostPort, path);
             return;
@@ -143,6 +147,10 @@ public class ProxyRouteBuilder extends RouteBuilder {
     private void postProcess(final Exchange exchange) {
         final Message msg = exchange.getMessage();
 
+        if (Boolean.TRUE.equals(exchange.getProperty(PROP_ACTIVE_ACQUIRED))) {
+            pressureMonitor.release();
+        }
+
         final CircuitBreaker cb = exchange.getProperty(PROP_CB, CircuitBreaker.class);
         if (cb != null) {
             cb.onSuccess(elapsed(exchange), TimeUnit.NANOSECONDS);
@@ -162,6 +170,10 @@ public class ProxyRouteBuilder extends RouteBuilder {
     // --- Exception handler: connectivity failure → CB error + 502 ---
 
     private void handleConnectivityException(final Exchange exchange) {
+        if (Boolean.TRUE.equals(exchange.getProperty(PROP_ACTIVE_ACQUIRED))) {
+            pressureMonitor.release();
+        }
+
         final CircuitBreaker cb = exchange.getProperty(PROP_CB, CircuitBreaker.class);
         final Exception ex = exchange.getProperty(Exchange.EXCEPTION_CAUGHT, Exception.class);
 

@@ -3,6 +3,7 @@ import hashlib
 import json
 import os
 import sys
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
 
@@ -16,6 +17,10 @@ class EchoHandler(BaseHTTPRequestHandler):
 
     def handle_request(self):
         parsed = urlparse(self.path)
+
+        delay_ms = int(self.headers.get("x-delay", 0) or 0)
+        if delay_ms > 0:
+            time.sleep(delay_ms / 1000.0)
 
         content_length = int(self.headers.get("Content-Length", 0) or 0)
         body = self.rfile.read(content_length) if content_length > 0 else b""
