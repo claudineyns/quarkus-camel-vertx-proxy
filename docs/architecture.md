@@ -59,7 +59,7 @@ A configuração TLS é **nomeada** (`quarkus.tls.proxy-tls.*`) e vinculada excl
 
 ## Lógica de roteamento dinâmico
 
-A base da URL de destino é resolvida em três etapas, em ordem de prioridade:
+A base da URL de destino é resolvida em duas etapas, em ordem de prioridade:
 
 ### 1. Primário — header `x-proxy-backend-base-url`
 
@@ -69,32 +69,24 @@ Quando presente, contém exclusivamente `protocolo://host:porta` (sem path). Exe
 x-proxy-backend-base-url: https://backend-service:8443
 ```
 
-### 2. Intermediário — URI absoluta da request-line (modo forward-proxy)
+### 2. Secundário — `Exchange.HTTP_URL`
 
-Quando o cliente envia uma URI absoluta na request-line (RFC 7230 §5.3.2), como:
+Quando o header primário está ausente, o proxy extrai `scheme://host[:port]` de `Exchange.HTTP_URL`, que o Vert.x constrói como `scheme://host/path` a partir do scheme do servidor e do header `Host` da requisição.
 
-```
-GET http://httpbin.org/get HTTP/1.1
-```
+**Modo forward-proxy:** o cliente define o header `Host` com o backend de destino (RFC 7230 §5.3.2), de forma que `Exchange.HTTP_URL` carrega a URL correta do backend.
 
-O proxy extrai `scheme://host[:port]` dessa URI usando `RoutingContext.request().uri()`, que retorna a URI bruta da request-line sem construção pelo Vert.x.
+**Sem header primário e sem forward-proxy:** o `Host` aponta para o próprio proxy, tornando `Exchange.HTTP_URL` auto-referencial — a guard de self-reference rejeita com 502.
 
-> **Nota comportamental**: Vert.x normaliza o scheme para o do servidor ao construir `request.absoluteURI()`. Por isso a extração é feita via `request.uri()` (raw), não via `Exchange.HTTP_URL`. Em servidores HTTPS, a URI raw de requests `http://` pode ser normalizada internamente pelo Vert.x antes de ser exposta; nesse caso o intermediário extrai `https://`, e o fallback não é acionado.
-
-Este passo suporta o uso do proxy no modo forward-proxy clássico, onde o client conecta diretamente ao proxy e inclui o destino completo na request-line.
-
-### 3. Fallback — header `Host` + scheme espelhado da porta de entrada
-
-Se nenhum dos passos anteriores produzir um destino, o proxy constrói a base a partir do header `Host` da requisição e do scheme da conexão de entrada (HTTP ou HTTPS). Equivale a um proxy transparente: o backend é o mesmo host anunciado pelo cliente, acessado pelo mesmo protocolo da porta de entrada.
+> **Nota de scheme:** o scheme em `Exchange.HTTP_URL` reflete o scheme do servidor (HTTP ou HTTPS da porta de entrada), não o da request-line. Em forward-proxy para um backend HTTP via entrada HTTPS, o proxy acessará o backend em HTTPS.
 
 ### Guard — self-reference
 
-Se o host resolvido (em qualquer das etapas acima) coincidir com o próprio proxy, a requisição é rejeitada imediatamente com **`502 Bad Gateway`** antes de qualquer tentativa de encaminhamento. Impede loops de roteamento e erros de configuração.
+Se a URL resolvida (em qualquer das etapas) apontar para o próprio proxy, a requisição é rejeitada imediatamente com **`502 Bad Gateway`** antes de qualquer tentativa de encaminhamento. Impede loops de roteamento e erros de configuração. Na ausência do header primário, esse guard é o mecanismo que transforma um request reverse-proxy sem rota explícita em 502.
 
 ### Composição da URL final de saída
 
 ```
-base   = <resolvida pelo primário, intermediário ou fallback>
+base   = <resolvida pelo primário ou secundário>
 path   → Exchange.HTTP_PATH
 query  → Exchange.HTTP_RAW_QUERY
 
@@ -111,7 +103,8 @@ URL de saída = base + path [+ ?query]
 |---|---|
 | `Host` | Recalculado para `host:port` do backend de destino |
 | `x-proxy-backend-base-url` | Removido antes do encaminhamento |
-| `Exchange.HTTP_URI` / `Exchange.HTTP_URL` | Removidos antes do `toD` para que o produtor Vert.x use o endpoint do `toD` como base da URL de saída, sem interferência dos valores relativos ao proxy definidos pelo consumer |
+| `Exchange.HTTP_URL` | Lido antes de qualquer remoção para resolução de backend (secundário) e para `X-Forwarded-Proto`; removido depois, junto com `HTTP_URI`, para que o produtor Vert.x use o endpoint do `toD` como base da URL de saída |
+| `Exchange.HTTP_URI` | Removido antes do `toD` pelo mesmo motivo que `HTTP_URL` |
 | Hop-by-hop (`Connection`, `Transfer-Encoding`, `TE`, `Upgrade`, `Keep-Alive`, `Trailers`) | Removidos antes do encaminhamento (RFC 7230) |
 | `X-Forwarded-For` | Injetado com o IP do cliente original (appended se já existir) |
 | `X-Forwarded-Proto` | Injetado com o scheme da porta de entrada (`http` ou `https`) |
@@ -310,25 +303,21 @@ Cliente (HTTP/1.1 ou HTTP/2)         Operações
          └────────┬───────────────────┘
                   │ ausente
          ┌────────┴───────────────────┐
-         │ URI absoluta na request-   │ intermediário
-         │ line (forward-proxy mode)  │ (RoutingContext.request().uri())
+         │ Exchange.HTTP_URL          │ secundário
+         │ (scheme://host[:port])     │
          └────────┬───────────────────┘
-                  │ URI relativa
-         ┌────────┴───────────────────┐
-         │ Host header + scheme de    │ fallback
-         │ entrada (proxy transparente│
-         └────────┬───────────────────┘
+                  │ null → 502 RFC 9457
                   │
-         host == proxy? ──────────────→ 502 RFC 9457 (loop)
+         host == proxy? ──────────────→ 502 RFC 9457 (loop / sem rota explícita)
                   │
          HWM excedido? ───────────────→ 503 RFC 9457 (backpressure)
                   │
          CB do host está OPEN? ───────→ 502 RFC 9457 (circuit open)
                   │
+         Remover hop-by-hop + header primário + pseudo-headers
          Injetar X-Forwarded-* headers
+         Remover HTTP_URI + HTTP_URL
          Setar HTTP_PATH + HTTP_RAW_QUERY
-         Recalcular Host header
-         Remover hop-by-hop + header primário
                   │
          [camel-vertx-http]                 followRedirects=false
          toD("scheme://host:port")          HTTP/1.1 + HTTP/2
@@ -565,9 +554,9 @@ curl -s \
 
 ---
 
-### T-07 — Modo forward-proxy: URI absoluta HTTP na request-line via HTTPS
+### T-07 — Modo forward-proxy: URI com Host de backend via HTTPS
 
-Valida o intermediário de roteamento: o cliente abre um `SSLSocket` bruto no proxy, envia `GET http://httpbin.org/get HTTP/1.1` com URI absoluta na request-line (sem header `x-proxy-backend-base-url`). O proxy deve extrair o destino da URI da request-line e encaminhar corretamente.
+Valida o secundário de roteamento: o cliente abre um `SSLSocket` bruto no proxy e envia `GET http://httpbin.org/get HTTP/1.1` com `Host: httpbin.org` (sem header `x-proxy-backend-base-url`). O Vert.x constrói `Exchange.HTTP_URL` como `https://httpbin.org/get` (scheme do servidor + Host do cliente), de onde o proxy extrai `https://httpbin.org` como destino.
 
 ```bash
 # Compilar (a partir da raiz do projeto)
@@ -576,19 +565,19 @@ javac -d temp infra/proxy-test/ProxyTest.java
 # Build da imagem de teste
 MSYS_NO_PATHCONV=1 podman build -t proxy-test:latest -f infra/proxy-test/Containerfile .
 
-# Executar (Cenário A — backend acessível via HTTP)
+# Executar
 MSYS_NO_PATHCONV=1 podman run --rm --network proxy-net \
   -e BACKEND_URL=http://httpbin.org/get \
   proxy-test:latest
 ```
 
-**Esperado:** logs do proxy mostram `→ [GET <scheme>://httpbin.org/get]` com `Host=httpbin.org` (não corrompido), `← backend [200]`, `← client [200]`. O scheme de saída reflete o que o Vert.x expõe via `request.uri()` para a conexão HTTPS de entrada.
+**Esperado:** logs do proxy mostram `→ [GET https://httpbin.org/get]` com `Host=httpbin.org`, `← backend [200]`, `← client [200]`. O scheme de saída é sempre o scheme do servidor (HTTPS), independentemente do scheme na request-line.
 
 ---
 
-### T-08 — Modo forward-proxy: URI absoluta HTTPS na request-line via HTTPS
+### T-08 — Modo forward-proxy: URI com Host de backend HTTPS via HTTPS
 
-Mesma mecânica do T-07, mas com backend HTTPS — valida que o proxy negocia TLS também na perna de saída ao extrair `https://` da URI da request-line.
+Mesma mecânica do T-07, mas `BACKEND_URL` já carrega `https://` — confirma que o proxy acessa o backend em HTTPS.
 
 ```bash
 MSYS_NO_PATHCONV=1 podman run --rm --network proxy-net \
