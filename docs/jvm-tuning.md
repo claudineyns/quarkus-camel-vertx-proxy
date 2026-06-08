@@ -202,4 +202,148 @@ Se o `Containerfile.ocp` for alterado:
 Xmx_recomendado = max(in_flight_bytes × 4, container_limit × 0.6)
 ```
 
-O fator 4× sobre o in-flight cobre: payload em Eden + promoção para Old Gen + overhead do G1 + margem para GC cycle. O `0.6` (60%) do container é o piso quando não há estimativa de workload.
+---
+
+## 9. Calibragem para proxy de IA (caso de uso primário)
+
+O proxy foi desenhado para intermediar chamadas a backends de agentes e modelos de IA. Este cenário tem características distintas de um proxy REST convencional e exige ajuste de parâmetros operacionais além da JVM.
+
+### 9.1 Perfil de carga esperado
+
+| Dimensão | Valor |
+|---|---|
+| Payload médio (request + response) | ~3 MB |
+| Pico de stress (janela curta) | até 10 MB |
+| Latência de inferência típica | 10–120 s |
+| Protocolo de resposta comum | chunked / SSE (streaming) |
+
+### 9.2 JVM com payloads de 3 MB — comportamento esperado
+
+Com região G1 de 1 MB (calculada para 320 MB heap), objetos de 3 MB são humongous e ocupam 3 regiões contíguas na Old Gen. Com 20 conexões simultâneas:
+
+| In-flight | Heap usado | RSS estimado | Headroom |
+|---|---|---|---|
+| 20 × 3 MB = 60 MB | ~130 MB | ~280 MB (55%) | ~230 MB |
+| 20 × 10 MB = 200 MB (stress) | ~310 MB | ~460 MB (86%) | ~50 MB |
+
+No cenário típico (3 MB), a pressão de GC humongous é substancialmente menor que no teste de 10 MB. Os parâmetros de JVM estão corretamente dimensionados para este workload — sem recalibração necessária.
+
+### 9.3 `proxy.active-requests.limit` (HWM)
+
+Definido em **20** como proteção contra o pior caso de stress. A fórmula:
+
+```
+HWM = floor(Xmx_MB × 0.60 / max_payload_MB)
+    = floor(320 × 0.60 / 10)
+    = 19  →  20
+```
+
+No cenário típico (3 MB médio), HWM=20 limita o in-flight a 60 MB — muito abaixo do teto. No pico de stress (10 MB), HWM=20 restringe a 200 MB in-flight, replicando o cenário testado e validado (86% RSS, 20/20 OK).
+
+Requisições que excedem o HWM são rejeitadas com `503 Service Unavailable RFC 9457` e o Readiness reporta DOWN — degradação controlada sem OOM.
+
+### 9.4 `proxy.http.client.response-timeout-ms` — ajuste crítico
+
+O timeout padrão de 5 000 ms é inadequado para backends de IA:
+
+| Backend | Latência típica |
+|---|---|
+| LLM (prompt curto, resposta curta) | 3–15 s |
+| LLM (prompt longo, resposta longa) | 30–120 s |
+| Visão computacional / multimodal | 10–30 s |
+| Embedding | 1–5 s |
+
+Com 5 s, o proxy retornaria timeout antes de qualquer resposta de inferência não-trivial. O timeout é classificado como `SocketTimeoutException` pela Vert.x, que **aciona o circuit breaker** — abrindo o circuito para um backend saudável porém lento.
+
+**Valor ajustado: 120 000 ms (120 s).** Cobre o intervalo até a chegada do primeiro byte da resposta. Para SSE/streaming, este timeout cobre apenas o início do stream; o `idle-timeout-s` cobre os gaps entre eventos.
+
+### 9.5 `proxy.http.client.idle-timeout-s` — ajuste
+
+Aumentado de 30 s para **60 s** para acomodar backends de IA com baixa taxa de emissão de tokens em inferências longas, onde a conexão pode ficar ociosa entre chunks sem que o backend tenha encerrado.
+
+### 9.6 Configuração resultante para o cenário de IA
+
+Em `application.properties`:
+
+```properties
+proxy.active-requests.limit=20
+proxy.http.client.connect-timeout-ms=5000
+proxy.http.client.response-timeout-ms=120000
+proxy.http.client.idle-timeout-s=60
+```
+
+Ambas as variáveis de ambiente são expostas no `infra/start-podman.sh` para override sem rebuild:
+
+```bash
+PROXY_ACTIVE_REQUESTS_LIMIT=20
+PROXY_HTTP_CLIENT_RESPONSE_TIMEOUT_MS=120000
+```
+
+---
+
+## 10. Modelo de dimensionamento de frota (escalabilidade horizontal)
+
+Em produção, múltiplas instâncias do proxy operam em paralelo atrás de um load balancer. Os testes de carga desta seção caracterizam a capacidade de uma instância individual para servir de base ao dimensionamento da frota.
+
+### 10.1 Dois limitantes por instância
+
+| Limitante | Parâmetro | Valor atual | Binding em |
+|---|---|---|---|
+| Memória (heap) | `proxy.active-requests.limit` (HWM) | 20 | payload ≥ 10 MB ou burst intenso |
+| Pool H1 por backend | `max-connections-per-host` | 20 | backend HTTP/1.1 com hostname único |
+| Pool H2 por backend | `http2-max-connections-per-host` | 5 conexões (multiplexadas) | backend HTTP/2; limitante real é o HWM |
+
+`max-connections-per-host` foi alinhado ao HWM (ambos = 20) para que memória e pool imponham o mesmo teto em backends H1, evitando sub-utilização do headroom de memória.
+
+### 10.2 Capacidade efetiva por instância
+
+```
+capacidade_instância = min(HWM, pool_efetivo_por_backend × n_backends)
+```
+
+| Cenário de backend | Capacidade por instância |
+|---|---|
+| API de IA hospedada (H2, 1 hostname) | 20 (HWM é o limitante; H2 multiplexa sobre 5 conexões) |
+| IA auto-hospedada (H1, 1 hostname) | 20 (pool e HWM alinhados) |
+| Múltiplos backends H1 distintos | 20 × n_backends (pool independente por host) |
+
+### 10.3 Fórmulas de dimensionamento
+
+**Por concorrência esperada (usuários/sessões simultâneos):**
+
+```
+instâncias = ceil(pico_concorrente / 20)
+```
+
+**Por throughput esperado** (domina quando a latência de inferência é longa):
+
+```
+instâncias = ceil(rps_esperado × latência_média_inferência_s / 20)
+```
+
+**Exemplos:**
+
+| Cenário | Cálculo | Instâncias |
+|---|---|---|
+| 50 usuários simultâneos | ceil(50 / 20) | **3** |
+| 100 usuários simultâneos | ceil(100 / 20) | **5** |
+| 10 RPS, inferência média 30 s | ceil(10 × 30 / 20) | **15** |
+| 5 RPS, inferência média 60 s | ceil(5 × 60 / 20) | **15** |
+
+### 10.4 Capacidade validada por testes
+
+| Cenário testado | Resultado | RSS pico | Status |
+|---|---|---|---|
+| 15 × 5 MB simultâneos | 15/15 OK | 340 MB (65%) | Confortável |
+| 20 × 5 MB simultâneos | 20/20 OK | ~370 MB (71%) | Confortável |
+| 20 × 10 MB simultâneos | 20/20 OK | 460 MB (86%) | Limite do stress |
+
+O limite de stress da instância (20 × 10 MB, RSS 86%) é o pior caso planejado. Em operação típica (3 MB médio), RSS permanece em ~55%, com ampla margem para absorver picos antes que o HWM entre em ação.
+
+### 10.5 Comportamento do HWM em frota
+
+Quando uma instância atinge o HWM, retorna `503 Service Unavailable` e o Readiness reporta DOWN. O load balancer deve:
+- Remover a instância dos endpoints ativos (Kubernetes faz isso via Readiness probe)
+- Rotear novas requisições para instâncias ainda abaixo do HWM
+
+Isso garante degradação localizada — uma instância saturada não afeta as demais. O dimensionamento com margem de 30% (`instâncias_calculadas × 1.3`) absorve picos momentâneos sem acionar o HWM.
