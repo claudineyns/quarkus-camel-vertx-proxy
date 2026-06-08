@@ -2,14 +2,20 @@ package io.github.claudineyns.proxy;
 
 import io.github.resilience4j.circuitbreaker.CircuitBreakerConfig;
 import io.github.resilience4j.circuitbreaker.CircuitBreakerRegistry;
+import io.github.resilience4j.micrometer.tagged.TaggedCircuitBreakerMetrics;
+import io.micrometer.core.instrument.MeterRegistry;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.enterprise.inject.Produces;
+import jakarta.inject.Inject;
 import org.eclipse.microprofile.config.inject.ConfigProperty;
 
 import java.time.Duration;
 
 @ApplicationScoped
 public class CircuitBreakerRegistryProducer {
+
+    @Inject
+    MeterRegistry meterRegistry;
 
     @ConfigProperty(name = "proxy.http.client.circuit-breaker.sliding-window-size", defaultValue = "10")
     int slidingWindowSize;
@@ -36,6 +42,11 @@ public class CircuitBreakerRegistryProducer {
             .waitDurationInOpenState(Duration.ofMillis(waitDurationOpenMs))
             .permittedNumberOfCallsInHalfOpenState(permittedCallsHalfOpen)
             .build();
-        return CircuitBreakerRegistry.of(config);
+        final CircuitBreakerRegistry registry = CircuitBreakerRegistry.of(config);
+        // Bind all current and future circuit breaker instances to Prometheus.
+        // TaggedCircuitBreakerMetrics registers a registry event listener so breakers
+        // created dynamically per host:port are exported automatically.
+        TaggedCircuitBreakerMetrics.ofCircuitBreakerRegistry(registry).bindTo(meterRegistry);
+        return registry;
     }
 }
