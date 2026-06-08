@@ -157,32 +157,42 @@ Toda configuração numérica relevante é externalizada via namespace `proxy.*`
 
 Outras configs numéricas relevantes identificadas durante a implementação seguem o mesmo padrão e namespace.
 
-### High water mark e Readiness
-
-Quando `proxy.http.client.pool.max-wait-queue-size != -1`, o parâmetro `proxy.http.client.pool.wait-queue-high-water-mark` torna-se obrigatório. Sua ausência causa falha rápida na inicialização.
+### Namespace `proxy.active-requests.*`
 
 | Propriedade | Default | Descrição |
 |---|---|---|
-| `proxy.http.client.pool.wait-queue-high-water-mark` | — | Percentual (ex: `0.80`); obrigatório quando `max-wait-queue-size != -1` |
+| `proxy.active-requests.limit` | `-1` | Máximo de requests em voo simultâneos. `-1` desabilita o limite. |
+
+Configurável em runtime via variável de ambiente `PROXY_ACTIVE_REQUESTS_LIMIT` (convenção de nome Quarkus).
+
+### High water mark e Readiness
+
+O limite de requests em voo é controlado por um `AtomicInteger` gerenciado pelo bean CDI `ConnectionPressureMonitor`, sem dependência de métricas externas.
 
 **Lógica do Readiness (SmallRye Health `@Readiness`):**
 
 ```
-agregado_atual  = Σ vertx.http.client.queue.pending  (todos os hosts via MeterRegistry)
-limite_hwm      = max-wait-queue-size × wait-queue-high-water-mark
+ativo_atual = AtomicInteger — incrementado após todos os guards passarem,
+                              decrementado ao fim de cada request (sucesso ou falha de conectividade)
 
-agregado_atual > limite_hwm  →  DOWN
-caso contrário               →  UP
+ativo_atual >= proxy.active-requests.limit  →  DOWN
+caso contrário (ou limite = -1)             →  UP
 ```
 
-A verificação é sobre o **total agregado** de conexões em fila em todos os backends simultaneamente.
-
-Quando o HWM é atingido, dois comportamentos ocorrem simultaneamente:
+Quando o limite é atingido, dois comportamentos ocorrem simultaneamente:
 
 1. **Readiness → DOWN**: o Kubernetes remove o pod dos endpoints do Service (sem restart).
-2. **Rejeição ativa → `503 Service Unavailable` RFC 9457**: novas requisições recebidas enquanto o HWM está excedido são rejeitadas imediatamente pelo proxy, sem tentar encaminhar ao backend.
+2. **Rejeição ativa → `503 Service Unavailable` RFC 9457**: novas requisições são rejeitadas imediatamente, sem tentativa de encaminhamento ao backend.
 
-Um bean CDI (`ConnectionPressureMonitor`) centraliza o estado do HWM, consultado tanto pelo health check quanto pela rota Camel no início de cada requisição.
+**API do `ConnectionPressureMonitor`:**
+
+| Método | Comportamento |
+|---|---|
+| `tryAcquire()` | Increment-then-check atômico: incrementa, verifica, desfaz se estourou. Retorna `false` sem incremento quando o limite seria excedido. |
+| `release()` | Decrementa o contador. Chamado em `postProcess` e no handler de exceção de conectividade, via flag `PROP_ACTIVE_ACQUIRED` no exchange. |
+| `isUnderPressure()` | Leitura não-atômica do estado atual. Usado exclusivamente pelo Readiness check. |
+
+O gauge `proxy.active.requests` expõe o contador ao Prometheus via Micrometer, registrado no startup via `Gauge.builder(...).register(meterRegistry)`.
 
 ---
 
@@ -198,7 +208,8 @@ Em ambientes Kubernetes, o pod recebe `SIGTERM` antes de ser terminado. O Quarku
 
 ## Circuit breaker (Resilience4j)
 
-- Dependências diretas: `io.github.resilience4j:resilience4j-circuitbreaker:2.2.0` e `resilience4j-micrometer:2.2.0` — declaradas explicitamente no `pom.xml`, sem depender de exposição transitiva. `resilience4j-micrometer` registra automaticamente as métricas de CB (estado, contagem de calls, failure rate) no Prometheus via `MeterRegistry`.
+- Dependências diretas: `io.github.resilience4j:resilience4j-circuitbreaker:2.2.0` e `resilience4j-micrometer:2.2.0` — declaradas explicitamente no `pom.xml`, sem depender de exposição transitiva.
+- Bind ao Prometheus feito explicitamente no `@Produces CircuitBreakerRegistry` via `TaggedCircuitBreakerMetrics.ofCircuitBreakerRegistry(registry).bindTo(meterRegistry)` — registra um listener no registry que exporta métricas (estado, failure rate, contagem de calls) automaticamente para qualquer CB criado dinamicamente por `host:port`.
 - Instâncias gerenciadas via `CircuitBreakerRegistry` como bean CDI — uma instância por `host:port` dinâmico, criada sob demanda.
 - **Gatilho exclusivo**: exceções de conectividade (`ConnectException`, `UnknownHostException`, `SocketTimeoutException`, `SSLException` e variantes Vert.x). Respostas HTTP do backend (incluindo 4xx/5xx) não acionam o CB.
 - Estados HALF-OPEN: falha de conectividade retorna o CB para OPEN e devolve 502 RFC 9457.
@@ -428,10 +439,11 @@ Diferenças em relação ao bridge:
 - Três portas expostas: HTTP + HTTPS + management (vs duas no bridge)
 - Sem montagem de volume de certificados de cliente (TLS server via `quarkus-tls-registry`)
 - Variáveis de ambiente do namespace `proxy.*` em vez das variáveis do bridge
+- `PROXY_ACTIVE_REQUESTS_LIMIT` configura `proxy.active-requests.limit` em runtime sem rebuild de imagem
 
 ---
 
-## Serviço de eco para testes *(implementação posterior)*
+## Serviço de eco para testes
 
 Container Podman auxiliar, independente do proxy, usado para validação de roteamento e comportamento de headers/payload.
 
@@ -456,6 +468,8 @@ Aceita qualquer método e path. Responde sempre `200 OK` com `Content-Type: appl
 - `payload_hash`: hash SHA-256 do body de entrada, presente somente quando o body não estiver vazio.
 - O payload em si **não é retornado** — apenas o hash, para evitar replay e manter a resposta leve independentemente do tamanho do body.
 - Todos os headers recebidos são refletidos, permitindo validar `X-Forwarded-*`, `Host` recalculado, remoção de hop-by-hop e ausência do header `x-proxy-backend-base-url`.
+
+**Header opcional `x-delay`:** aceita um valor inteiro em milissegundos; quando presente, aplica um `sleep` antes de montar a resposta. Usado em testes de backpressure (HWM) para manter requests em voo durante a janela de verificação.
 
 ### Infraestrutura
 
