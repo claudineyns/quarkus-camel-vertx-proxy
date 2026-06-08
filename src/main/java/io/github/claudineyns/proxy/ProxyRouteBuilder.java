@@ -2,7 +2,6 @@ package io.github.claudineyns.proxy;
 
 import io.github.resilience4j.circuitbreaker.CircuitBreaker;
 import io.github.resilience4j.circuitbreaker.CircuitBreakerRegistry;
-import io.vertx.ext.web.RoutingContext;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import org.apache.camel.Exchange;
@@ -115,27 +114,24 @@ public class ProxyRouteBuilder extends RouteBuilder {
         exchange.setProperty(PROP_CB, cb);
         exchange.setProperty(PROP_CB_START_NS, System.nanoTime());
 
-        // 6. Inject X-Forwarded-* headers (before Host recalculation)
-        injectForwardedHeaders(exchange, msg);
-
-        // 7. Recalculate Host header for outbound request
-        final URI backendUri = URI.create(backendBase);
-        final int port = backendUri.getPort();
-        msg.setHeader("Host",
-            port > 0 ? backendUri.getHost() + ":" + port : backendUri.getHost());
-
-        // 8. Remove hop-by-hop headers + primary routing header + query param headers
+        // 6. Remove hop-by-hop, query-param, routing, and pseudo-headers before injecting
+        // X-Forwarded headers, so Connection-header tokens cannot strip what we inject next.
         removeHopByHopHeaders(msg);
         removeQueryParamHeaders(msg);
         msg.removeHeader("x-proxy-backend-base-url");
-
-        // Exchange.HTTP_PATH and Exchange.HTTP_RAW_QUERY carry path and query for the outbound request.
-        // HTTP_URI and HTTP_URL (set by consumer, pointing to the proxy itself) must be cleared so
-        // the vertx-http producer uses the toD endpoint URI as base instead of the consumer's URL.
         // "*" is the request-line pseudo-header added by newer Camel versions — must not be forwarded.
+        msg.removeHeader("*");
+
+        // 7. Inject X-Forwarded-* headers. Must run before HTTP_URL is removed because
+        // incomingScheme reads HTTP_URL to detect whether the incoming connection is HTTP or HTTPS.
+        // Host is intentionally not recalculated: Vert.x WebClient sets it automatically from the
+        // target URL and the HttpHeaderFilterStrategy filters any Host in the Camel exchange anyway.
+        injectForwardedHeaders(exchange, msg);
+
+        // 8. Clear consumer-set URL headers so the vertx-http producer uses the toD endpoint as
+        // the base URL, not the proxy's own URL set by the consumer.
         msg.removeHeader(Exchange.HTTP_URI);
         msg.removeHeader(Exchange.HTTP_URL);
-        msg.removeHeader("*");
 
         // 9. Store target for toD
         exchange.setProperty(PROP_TARGET_BASE,
@@ -190,51 +186,36 @@ public class ProxyRouteBuilder extends RouteBuilder {
     // --- URL resolution ---
 
     private String resolveBackendBase(final Exchange exchange) {
-        // Primary: explicit header
+        // Primary: explicit header (scheme://host:port only)
         final String primary = exchange.getMessage().getHeader("x-proxy-backend-base-url", String.class);
         if (primary != null && !primary.isBlank()) {
             return primary.strip();
         }
 
-        // Intermediate: absolute URI from request-line (forward-proxy mode).
-        // Exchange.HTTP_URL is avoided here: Vert.x constructs it as serverOrigin + rawUri,
-        // corrupting the value when the incoming scheme differs from the request-line scheme.
-        // routingContext.request().uri() returns the raw request-line URI without modification.
-        final Object rc = exchange.getProperty("CamelVertxPlatformHttpRoutingContext");
-        if (rc instanceof RoutingContext routingContext) {
-            final String rawUri = routingContext.request().uri();
-            if (rawUri != null && (rawUri.startsWith("http://") || rawUri.startsWith("https://"))) {
-                try {
-                    final URI parsed = URI.create(rawUri);
-                    if (parsed.getScheme() != null && parsed.getHost() != null) {
-                        final int port = parsed.getPort();
-                        return parsed.getScheme() + "://" + parsed.getHost()
-                            + (port > 0 ? ":" + port : "");
-                    }
-                } catch (final IllegalArgumentException ignored) {
-                }
-            }
-        }
-
-        // Fallback: Host header + scheme mirrored from the incoming connection.
-        final String hostHeader = exchange.getMessage().getHeader("Host",
-            exchange.getMessage().getHeader("host", String.class), String.class);
-        if (hostHeader == null || hostHeader.isBlank()) {
+        // Secondary: extract scheme://host:port from Exchange.HTTP_URL.
+        // Vert.x builds HTTP_URL as scheme://host/path using the server's scheme and the Host header.
+        // In forward-proxy mode the client sets Host to the backend, so HTTP_URL carries the correct
+        // destination. Without x-proxy-backend-base-url, a plain reverse-proxy request has the proxy's
+        // own host in Host, making HTTP_URL self-referential — caught by the self-reference guard.
+        final String httpUrl = exchange.getMessage().getHeader(Exchange.HTTP_URL, String.class);
+        if (httpUrl == null || httpUrl.isBlank()) {
             return null;
         }
-        return incomingScheme(exchange) + "://" + hostHeader.strip();
+        try {
+            final URI parsed = URI.create(httpUrl);
+            if (parsed.getScheme() != null && parsed.getHost() != null) {
+                final int port = parsed.getPort();
+                return parsed.getScheme() + "://" + parsed.getHost()
+                    + (port > 0 ? ":" + port : "");
+            }
+        } catch (final IllegalArgumentException ignored) {
+        }
+        return null;
     }
 
     private String incomingScheme(final Exchange exchange) {
-        final Object rc = exchange.getProperty("CamelVertxPlatformHttpRoutingContext");
-        if (rc instanceof RoutingContext routingContext) {
-            return routingContext.request().scheme();
-        }
         final String url = exchange.getMessage().getHeader(Exchange.HTTP_URL, String.class);
-        if (url != null && url.startsWith("https://")) {
-            return "https";
-        }
-        return "http";
+        return (url != null && url.startsWith("https://")) ? "https" : "http";
     }
 
     private boolean isSelfReference(final String backendBase) {
@@ -258,24 +239,47 @@ public class ProxyRouteBuilder extends RouteBuilder {
     // --- Header helpers ---
 
     private void injectForwardedHeaders(final Exchange exchange, final Message msg) {
-        final Object rc = exchange.getProperty("CamelVertxPlatformHttpRoutingContext");
+        // CamelVertxPlatformHttpRemoteAddress / LocalAddress are set by the platform-http consumer
+        // in "host:port" format. They provide the same data as RoutingContext without requiring the
+        // broken exchange-property lookup for the RoutingContext object.
         final String originalHost = msg.getHeader("Host",
             msg.getHeader("host", String.class), String.class);
 
-        if (rc instanceof RoutingContext routingContext) {
-            final String clientIp = routingContext.request().remoteAddress().hostAddress();
+        final String remoteAddr = msg.getHeader("CamelVertxPlatformHttpRemoteAddress", String.class);
+        if (remoteAddr != null) {
+            final String clientIp = hostPart(remoteAddr);
             if (clientIp != null) {
                 final String existing = msg.getHeader("X-Forwarded-For", String.class);
                 msg.setHeader("X-Forwarded-For", existing != null ? existing + ", " + clientIp : clientIp);
             }
-            msg.setHeader("X-Forwarded-Proto", routingContext.request().scheme());
-            msg.setHeader("X-Forwarded-Port", String.valueOf(routingContext.request().localAddress().port()));
-        } else {
-            msg.setHeader("X-Forwarded-Proto", incomingScheme(exchange));
         }
+
+        msg.setHeader("X-Forwarded-Proto", incomingScheme(exchange));
+
+        final String localAddr = msg.getHeader("CamelVertxPlatformHttpLocalAddress", String.class);
+        if (localAddr != null) {
+            final String localPort = portPart(localAddr);
+            if (localPort != null) {
+                msg.setHeader("X-Forwarded-Port", localPort);
+            }
+        }
+
         if (originalHost != null) {
             msg.setHeader("X-Forwarded-Host", originalHost);
         }
+    }
+
+    // Returns the host part of a "host:port" string (handles IPv4 and bare hostnames).
+    private static String hostPart(final String hostPort) {
+        final int lastColon = hostPort.lastIndexOf(':');
+        return lastColon > 0 ? hostPort.substring(0, lastColon) : hostPort;
+    }
+
+    // Returns the port part of a "host:port" string, or null if absent.
+    private static String portPart(final String hostPort) {
+        final int lastColon = hostPort.lastIndexOf(':');
+        if (lastColon < 0 || lastColon == hostPort.length() - 1) return null;
+        return hostPort.substring(lastColon + 1);
     }
 
     private void removeHopByHopHeaders(final Message msg) {
