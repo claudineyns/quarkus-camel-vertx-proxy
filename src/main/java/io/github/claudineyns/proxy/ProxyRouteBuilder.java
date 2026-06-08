@@ -1,5 +1,7 @@
 package io.github.claudineyns.proxy;
 
+import io.github.resilience4j.bulkhead.Bulkhead;
+import io.github.resilience4j.bulkhead.BulkheadRegistry;
 import io.github.resilience4j.circuitbreaker.CircuitBreaker;
 import io.github.resilience4j.circuitbreaker.CircuitBreakerRegistry;
 import jakarta.enterprise.context.ApplicationScoped;
@@ -34,6 +36,9 @@ public class ProxyRouteBuilder extends RouteBuilder {
 
     @Inject
     CircuitBreakerRegistry cbRegistry;
+
+    @Inject
+    BulkheadRegistry bulkheadRegistry;
 
     @Inject
     ConnectionPressureMonitor pressureMonitor;
@@ -97,28 +102,37 @@ public class ProxyRouteBuilder extends RouteBuilder {
             return;
         }
 
-        // 4. High-water-mark: acquire in-flight slot atomically
+        // 4. High-water-mark: acquire global in-flight slot
         if (!pressureMonitor.tryAcquire()) {
             buildProblem(msg, 503, "/problems/service-unavailable", "Service Unavailable",
                 "Connection queue threshold exceeded", path);
             return;
         }
-        exchange.setProperty(PROP_ACTIVE_ACQUIRED, Boolean.TRUE);
 
-        // 5. Circuit breaker check
+        // 5. Per-host bulkhead: acquire slot for this backend
         final String hostPort = extractHostPort(backendBase);
+        final Bulkhead bulkhead = bulkheadRegistry.bulkhead(hostPort);
+        if (!bulkhead.tryAcquirePermission()) {
+            pressureMonitor.release();
+            buildProblem(msg, 503, "/problems/service-unavailable", "Service Unavailable",
+                "Backend connection limit exceeded: " + hostPort, path);
+            return;
+        }
+
+        // 6. Circuit breaker check — all guards passed after this point
         final CircuitBreaker cb = cbRegistry.circuitBreaker(hostPort);
         if (!cb.tryAcquirePermission()) {
+            bulkhead.releasePermission();
             pressureMonitor.release();
-            exchange.removeProperty(PROP_ACTIVE_ACQUIRED);
             buildProblem(msg, 502, "/problems/bad-gateway", "Bad Gateway",
                 "Circuit open: " + hostPort, path);
             return;
         }
+        exchange.setProperty(PROP_ACTIVE_ACQUIRED, hostPort);
         exchange.setProperty(PROP_CB, cb);
         exchange.setProperty(PROP_CB_START_NS, System.nanoTime());
 
-        // 6. Remove hop-by-hop, query-param, routing, and pseudo-headers before injecting
+        // 7. Remove hop-by-hop, query-param, routing, and pseudo-headers before injecting
         // X-Forwarded headers, so Connection-header tokens cannot strip what we inject next.
         removeHopByHopHeaders(msg);
         removeQueryParamHeaders(msg);
@@ -126,18 +140,18 @@ public class ProxyRouteBuilder extends RouteBuilder {
         // "*" is the request-line pseudo-header added by newer Camel versions — must not be forwarded.
         msg.removeHeader("*");
 
-        // 7. Inject X-Forwarded-* headers. Must run before HTTP_URL is removed because
+        // 8. Inject X-Forwarded-* headers. Must run before HTTP_URL is removed because
         // incomingScheme reads HTTP_URL to detect whether the incoming connection is HTTP or HTTPS.
         // Host is intentionally not recalculated: Vert.x WebClient sets it automatically from the
         // target URL and the HttpHeaderFilterStrategy filters any Host in the Camel exchange anyway.
         injectForwardedHeaders(exchange, msg);
 
-        // 8. Clear consumer-set URL headers so the vertx-http producer uses the toD endpoint as
+        // 9. Clear consumer-set URL headers so the vertx-http producer uses the toD endpoint as
         // the base URL, not the proxy's own URL set by the consumer.
         msg.removeHeader(Exchange.HTTP_URI);
         msg.removeHeader(Exchange.HTTP_URL);
 
-        // 9. Store target for toD
+        // 10. Store target for toD
         exchange.setProperty(PROP_TARGET_BASE,
             backendBase.endsWith("/") ? backendBase.substring(0, backendBase.length() - 1) : backendBase);
     }
@@ -147,7 +161,9 @@ public class ProxyRouteBuilder extends RouteBuilder {
     private void postProcess(final Exchange exchange) {
         final Message msg = exchange.getMessage();
 
-        if (Boolean.TRUE.equals(exchange.getProperty(PROP_ACTIVE_ACQUIRED))) {
+        final String acquiredHost = exchange.getProperty(PROP_ACTIVE_ACQUIRED, String.class);
+        if (acquiredHost != null) {
+            bulkheadRegistry.bulkhead(acquiredHost).releasePermission();
             pressureMonitor.release();
         }
 
@@ -170,7 +186,9 @@ public class ProxyRouteBuilder extends RouteBuilder {
     // --- Exception handler: connectivity failure → CB error + 502 ---
 
     private void handleConnectivityException(final Exchange exchange) {
-        if (Boolean.TRUE.equals(exchange.getProperty(PROP_ACTIVE_ACQUIRED))) {
+        final String acquiredHost = exchange.getProperty(PROP_ACTIVE_ACQUIRED, String.class);
+        if (acquiredHost != null) {
+            bulkheadRegistry.bulkhead(acquiredHost).releasePermission();
             pressureMonitor.release();
         }
 

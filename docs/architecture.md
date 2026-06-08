@@ -161,38 +161,49 @@ Outras configs numéricas relevantes identificadas durante a implementação seg
 
 | Propriedade | Default | Descrição |
 |---|---|---|
-| `proxy.active-requests.limit` | `-1` | Máximo de requests em voo simultâneos. `-1` desabilita o limite. |
+| `proxy.active-requests.limit` | `-1` | Máximo de requests em voo simultâneos (global). `-1` desabilita o limite. |
+| `proxy.active-requests.per-host-limit` | `-1` | Máximo de requests em voo por backend (`scheme+host:port`). `-1` desabilita o cap por host. |
 
-Configurável em runtime via variável de ambiente `PROXY_ACTIVE_REQUESTS_LIMIT` (convenção de nome Quarkus).
+Configuráveis em runtime via variáveis de ambiente `PROXY_ACTIVE_REQUESTS_LIMIT` e `PROXY_ACTIVE_REQUESTS_PER_HOST_LIMIT` (convenção de nome Quarkus).
 
-### High water mark e Readiness
+### Backpressure em dois níveis e Readiness
 
-O limite de requests em voo é controlado por um `AtomicInteger` gerenciado pelo bean CDI `ConnectionPressureMonitor`, sem dependência de métricas externas.
+O controle de concorrência opera em dois níveis independentes, alinhados à mesma granularidade do circuit breaker e do pool de conexões:
+
+| Nível | Mecanismo | Granularidade | Afeta Readiness |
+|---|---|---|---|
+| Global | `AtomicInteger` (`ConnectionPressureMonitor`) | Aplicação inteira | **Sim** → DOWN |
+| Por host | Resilience4j `BulkheadRegistry` | `scheme+host:port` | Não |
 
 **Lógica do Readiness (SmallRye Health `@Readiness`):**
 
 ```
-ativo_atual = AtomicInteger — incrementado após todos os guards passarem,
-                              decrementado ao fim de cada request (sucesso ou falha de conectividade)
-
-ativo_atual >= proxy.active-requests.limit  →  DOWN
-caso contrário (ou limite = -1)             →  UP
+ativo_global >= proxy.active-requests.limit  →  DOWN
+caso contrário (ou limite = -1)              →  UP
 ```
 
-Quando o limite é atingido, dois comportamentos ocorrem simultaneamente:
+O esgotamento por host (`per-host-limit`) rejeita a requisição com 503, mas não altera o Readiness — outros backends continuam acessíveis e o pod permanece nos endpoints do Kubernetes Service.
+
+Quando o limite **global** é atingido, dois comportamentos ocorrem simultaneamente:
 
 1. **Readiness → DOWN**: o Kubernetes remove o pod dos endpoints do Service (sem restart).
-2. **Rejeição ativa → `503 Service Unavailable` RFC 9457**: novas requisições são rejeitadas imediatamente, sem tentativa de encaminhamento ao backend.
+2. **Rejeição ativa → `503 Service Unavailable` RFC 9457**: novas requisições são rejeitadas imediatamente.
 
 **API do `ConnectionPressureMonitor`:**
 
 | Método | Comportamento |
 |---|---|
 | `tryAcquire()` | Increment-then-check atômico: incrementa, verifica, desfaz se estourou. Retorna `false` sem incremento quando o limite seria excedido. |
-| `release()` | Decrementa o contador. Chamado em `postProcess` e no handler de exceção de conectividade, via flag `PROP_ACTIVE_ACQUIRED` no exchange. |
+| `release()` | Decrementa o contador. |
 | `isUnderPressure()` | Leitura não-atômica do estado atual. Usado exclusivamente pelo Readiness check. |
 
-O gauge `proxy.active.requests` expõe o contador ao Prometheus via Micrometer, registrado no startup via `Gauge.builder(...).register(meterRegistry)`.
+**Bulkhead por host (`BulkheadRegistry`):**
+
+Instâncias criadas sob demanda por chave `scheme+host:port`, espelhando o `CircuitBreakerRegistry`. Quando `per-host-limit = -1`, o `maxConcurrentCalls` é configurado com `Integer.MAX_VALUE` — instâncias são criadas mesmo assim para exportar métricas por host via `TaggedBulkheadMetrics`.
+
+O gauge `proxy.active.requests` expõe o contador global ao Prometheus. Métricas por host (`resilience4j.bulkhead.active` tagged por `name=host:port`) são exportadas automaticamente pelo listener do registry.
+
+A propriedade de exchange `PROP_ACTIVE_ACQUIRED` armazena a chave do host (`String scheme+host:port`) somente quando **todos** os guards (global, bulkhead e circuit breaker) foram adquiridos com sucesso. O release em `postProcess` e no handler de exceção de conectividade usa essa chave para liberar o bulkhead e o contador global atomicamente.
 
 ---
 
@@ -290,7 +301,8 @@ Content-Type: application/problem+json
 | Circuito aberto | `502` | `"Circuit open: <host:port>"` |
 | Redirect do backend | `502` | `"Unexpected backend response: <3xx status>"` |
 | 429 do backend | `502` | `"Unexpected backend response: 429"` |
-| HWM excedido (backpressure) | `503` | `"Connection queue threshold exceeded"` |
+| Limite global excedido | `503` | `"Connection queue threshold exceeded"` |
+| Limite por host excedido | `503` | `"Backend connection limit exceeded: <host:port>"` |
 | WebSocket upgrade | `501` | `"WebSocket not supported"` |
 
 ---
@@ -321,7 +333,9 @@ Cliente (HTTP/1.1 ou HTTP/2)         Operações
                   │
          host == proxy? ──────────────→ 502 RFC 9457 (loop / sem rota explícita)
                   │
-         HWM excedido? ───────────────→ 503 RFC 9457 (backpressure)
+         Global HWM excedido? ────────→ 503 RFC 9457 (backpressure global) → Readiness DOWN
+                  │
+         Bulkhead por host excedido? ─→ 503 RFC 9457 (backpressure por host)
                   │
          CB do host está OPEN? ───────→ 502 RFC 9457 (circuit open)
                   │
@@ -633,3 +647,4 @@ Para inspecionar headers em cada fase, iniciar o container com `QUARKUS_LOG_CATE
 - Múltiplas políticas TLS por backend
 - Transformação ou inspeção do body
 - Autenticação no proxy
+- Isolamento de concorrência intra-host: o bulkhead opera por `scheme+host:port`; endpoints de latência heterogênea no mesmo host (ex.: `tools/call` vs `prompts/get` via MCP JSON-RPC no mesmo path) compartilham o mesmo contador. Resolver esse caso exigiria inspeção do body (incompatível com `stream-caching-enabled=false`) ou um header de classificação do caller (`x-proxy-bulkhead-group`) — ambos fora do perfil de laboratório atual.
